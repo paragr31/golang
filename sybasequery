@@ -1,0 +1,121 @@
+package main
+
+import (
+	"compress/gzip"
+	"database/sql"
+	"fmt"
+	"log"
+	"os"
+
+	_ "github.com/thda/tds"
+)
+
+func main() {
+	// Database connection string
+	connString := "your_user:your_password@tcp(your_server:port)/your_database"
+
+	// Open a connection to the database
+	db, err := sql.Open("tds", connString)
+	if err != nil {
+		log.Fatal("Error opening connection: ", err)
+	}
+	defer db.Close()
+
+	// Query to get the table structure
+	structureQuery := "SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'your_table'"
+	structureRows, err := db.Query(structureQuery)
+	if err != nil {
+		log.Fatal("Error querying table structure: ", err)
+	}
+	defer structureRows.Close()
+
+	// Create a .gz file
+	file, err := os.Create("output.gz")
+	if err != nil {
+		log.Fatal("Error creating file: ", err)
+	}
+	defer file.Close()
+
+	// Create a gzip writer
+	gzWriter := gzip.NewWriter(file)
+	defer gzWriter.Close()
+
+	// Write the table structure to the gzip file
+	_, err = gzWriter.Write([]byte("Table Structure:\n"))
+	if err != nil {
+		log.Fatal("Error writing to gzip file: ", err)
+	}
+
+	for structureRows.Next() {
+		var columnName string
+		var dataType string
+		if err := structureRows.Scan(&columnName, &dataType); err != nil {
+			log.Fatal("Error scanning structure row: ", err)
+		}
+		_, err := fmt.Fprintf(gzWriter, "Column: %s, Type: %s\n", columnName, dataType)
+		if err != nil {
+			log.Fatal("Error writing structure to gzip file: ", err)
+		}
+	}
+
+	if err := structureRows.Err(); err != nil {
+		log.Fatal("Error with structure rows: ", err)
+	}
+
+	// Query the data from the table
+	dataQuery := "SELECT * FROM your_table"
+	dataRows, err := db.Query(dataQuery)
+	if err != nil {
+		log.Fatal("Error querying data: ", err)
+	}
+	defer dataRows.Close()
+
+	// Write data to the gzip file
+	_, err = gzWriter.Write([]byte("\nData:\n"))
+	if err != nil {
+		log.Fatal("Error writing to gzip file: ", err)
+	}
+
+	// Get column names for data writing
+	columns, err := dataRows.Columns()
+	if err != nil {
+		log.Fatal("Error getting columns: ", err)
+	}
+
+	// Create a slice to hold the values
+	values := make([]interface{}, len(columns))
+	for i := range values {
+		var v interface{}
+		values[i] = &v
+	}
+
+	for dataRows.Next() {
+		if err := dataRows.Scan(values...); err != nil {
+			log.Fatal("Error scanning data row: ", err)
+		}
+
+		// Write the data to the gzip writer
+		for i, v := range values {
+			if i > 0 {
+				_, err := fmt.Fprintf(gzWriter, ",")
+				if err != nil {
+					log.Fatal("Error writing to gzip file: ", err)
+				}
+			}
+			_, err := fmt.Fprintf(gzWriter, "%v", *(v.(*interface{})))
+			if err != nil {
+				log.Fatal("Error writing to gzip file: ", err)
+			}
+		}
+		_, err := gzWriter.Write([]byte("\n"))
+		if err != nil {
+			log.Fatal("Error writing to gzip file: ", err)
+		}
+	}
+
+	if err := dataRows.Err(); err != nil {
+		log.Fatal("Error with data rows: ", err)
+	}
+
+	fmt.Println("Table structure and data have been written to output.gz")
+}
