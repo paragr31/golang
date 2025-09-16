@@ -1,0 +1,563 @@
+// sybase_snowflake_export.go
+// Comprehensive Golang script that:
+// 1. Connects to Sybase IQ (via database/sql — supply driver name and DSN in config)
+// 2. Connects to Snowflake using key-based (JWT) authentication
+// 3. Reads a config.json containing Snowflake and Sybase settings plus static metadata
+// 4. Reads column sequence & types from Sybase (INFORMATION_SCHEMA.COLUMNS)
+// 5. Builds a type-aware SELECT for Snowflake (formats dates/timestamps/numbers predictably)
+// 6. Streams query results into a .gz file using configured binary field/line separators
+// 7. Computes gzip file size, sha256, row count, and number of gzip members
+// 8. Renders an XML metadata file from a template and moves the .gz + .xml to landing path
+
+/*
+SAMPLE config.json (place alongside the binary):
+{
+  "sybase": {
+    "driver": "odbc",                        // the database/sql driver name you will use (eg. "odbc", "dblib", etc.)
+    "dsn": "DSN=iq_dsn;UID=user;PWD=pass;"  // or full connection string — store securely
+  },
+  "snowflake": {
+    "account": "your_account",
+    "user": "your_user",
+    "privateKeyPath": "/path/to/rsa_key.p8",
+    "role": "SYSADMIN",
+    "warehouse": "COMPUTE_WH",
+    "database": "MYDB"
+  },
+  "static": {
+    "tables": [ { "schema": "PUBLIC", "name": "CUSTOMERS" } ],
+    "recycleDate": "2025-09-01",
+    "rangeStart": "0",
+    "rangeEnd": "1000",
+    "dataFilePath": "/tmp/out",
+    "landingFilePath": "/data/landing",
+    "logFilePath": "/tmp/logs",
+    "schemaWritingDir": "/tmp/schema",
+    "reconWritingDir": "/tmp/recon",
+    "xmlTemplatePath": "./template.xml",
+    "fieldSeparatorBinary": "\u0001",   // control-A as example
+    "lineSeparatorBinary": "\n"
+  },
+  "output": {
+    "nullString": "\\N",
+    "escapeSequence": "\\",
+    "newlineReplacement": " ",
+    "booleanAsInt": true,
+    "dateFormat": "YYYY-MM-DD",
+    "timestampFormat": "YYYY-MM-DD HH24:MI:SS.FF6",
+    "chunkRows": 0   // 0 = no chunking; otherwise split after this many rows
+  }
+}
+
+SAMPLE XML template (template.xml):
+<?xml version="1.0" encoding="UTF-8"?>
+<filemeta>
+  <filename>{{.FileName}}</filename>
+  <sha256>{{.SHA256}}</sha256>
+  <filesize>{{.FileSize}}</filesize>
+  <rows>{{.Rows}}</rows>
+  <gzipMembers>{{.GzipMembers}}</gzipMembers>
+  <tableschema>{{.SchemaFilePath}}</tableschema>
+  <reconciliation>{{.ReconFilePath}}</reconciliation>
+  <recycleDate>{{.RecycleDate}}</recycleDate>
+  <rangeStart>{{.RangeStart}}</rangeStart>
+  <rangeEnd>{{.RangeEnd}}</rangeEnd>
+</filemeta>
+*/
+
+package main
+
+import (
+	"compress/gzip"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"database/sql"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"text/template"
+	"time"
+
+	gosnowflake "github.com/snowflakedb/gosnowflake"
+	_ "github.com/snowflakedb/gosnowflake"
+)
+
+// Config structures
+type Config struct {
+	Sybase struct {
+		Driver string `json:"driver"`
+		DSN    string `json:"dsn"`
+	} `json:"sybase"`
+	Snowflake struct {
+		Account        string `json:"account"`
+		User           string `json:"user"`
+		PrivateKeyPath string `json:"privateKeyPath"`
+		Role           string `json:"role"`
+		Warehouse      string `json:"warehouse"`
+		Database       string `json:"database"`
+	} `json:"snowflake"`
+	Static struct {
+		Tables               []struct{ Schema, Name string } `json:"tables"`
+		RecycleDate          string `json:"recycleDate"`
+		RangeStart           string `json:"rangeStart"`
+		RangeEnd             string `json:"rangeEnd"`
+		DataFilePath         string `json:"dataFilePath"`
+		LandingFilePath      string `json:"landingFilePath"`
+		LogFilePath          string `json:"logFilePath"`
+		SchemaWritingDir     string `json:"schemaWritingDir"`
+		ReconWritingDir      string `json:"reconWritingDir"`
+		XMLTemplatePath      string `json:"xmlTemplatePath"`
+		FieldSeparatorBinary string `json:"fieldSeparatorBinary"`
+		LineSeparatorBinary  string `json:"lineSeparatorBinary"`
+	} `json:"static"`
+	Output struct {
+		NullString         string `json:"nullString"`
+		EscapeSequence     string `json:"escapeSequence"`
+		NewlineReplacement string `json:"newlineReplacement"`
+		BooleanAsInt       bool   `json:"booleanAsInt"`
+		DateFormat         string `json:"dateFormat"`
+		TimestampFormat    string `json:"timestampFormat"`
+		ChunkRows          int64  `json:"chunkRows"`
+	} `json:"output"`
+}
+
+// metadata for XML template
+type XMLMeta struct {
+	FileName       string
+	SHA256         string
+	FileSize       int64
+	Rows           int64
+	GzipMembers    int
+	SchemaFilePath string
+	ReconFilePath  string
+	RecycleDate    string
+	RangeStart     string
+	RangeEnd       string
+}
+
+// loadPrivateKey reads PEM and supports PKCS1 and PKCS8 RSA private keys.
+func loadPrivateKey(path string) (*rsa.PrivateKey, error) {
+	b, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(b)
+	if block == nil {
+		return nil, errors.New("failed to decode PEM block")
+	}
+	// try PKCS8
+	if key, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
+		if rsaKey, ok := key.(*rsa.PrivateKey); ok {
+			return rsaKey, nil
+		}
+	}
+	// try PKCS1
+	if rsaKey, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+		return rsaKey, nil
+	}
+	return nil, errors.New("unsupported private key format")
+}
+
+func main() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	cfg, err := readConfig("config.json")
+	if err != nil {
+		log.Fatalf("read config: %v", err)
+	}
+
+	// ensure dirs exist
+	_ = os.MkdirAll(cfg.Static.SchemaWritingDir, 0o755)
+	_ = os.MkdirAll(cfg.Static.ReconWritingDir, 0o755)
+	_ = os.MkdirAll(cfg.Static.LandingFilePath, 0o755)
+
+	// connect to sybase
+	sydb, err := sql.Open(cfg.Sybase.Driver, cfg.Sybase.DSN)
+	if err != nil {
+		log.Fatalf("open sybase: %v", err)
+	}
+	defer sydb.Close()
+
+	// connect to snowflake
+	priv, err := loadPrivateKey(cfg.Snowflake.PrivateKeyPath)
+	if err != nil {
+		log.Fatalf("load snowflake private key: %v", err)
+	}
+	sfCfg := gosnowflake.Config{
+		Account:       cfg.Snowflake.Account,
+		User:          cfg.Snowflake.User,
+		Role:          cfg.Snowflake.Role,
+		Warehouse:     cfg.Snowflake.Warehouse,
+		Database:      cfg.Snowflake.Database,
+		Authenticator: gosnowflake.AuthTypeJwt,
+		PrivateKey:    priv,
+	}
+	dsn, err := gosnowflake.DSN(&sfCfg)
+	if err != nil {
+		log.Fatalf("build snowflake dsn: %v", err)
+	}
+	sfdb, err := sql.Open("snowflake", dsn)
+	if err != nil {
+		log.Fatalf("open snowflake: %v", err)
+	}
+	defer sfdb.Close()
+
+	// Process each table
+	for _, t := range cfg.Static.Tables {
+		schema := t.Schema
+		table := t.Name
+		log.Printf("Processing %s.%s", schema, table)
+
+		// 5. read column sequence from sybase
+		cols, err := getTableColumnsFromSybase(sydb, schema, table)
+		if err != nil {
+			log.Printf("get columns: %v", err)
+			continue
+		}
+
+		// write schema metadata file (simple CSV of columns)
+		schemaFile := filepath.Join(cfg.Static.SchemaWritingDir, fmt.Sprintf("%s_%s.schema", schema, table))
+		if err := writeSchemaFile(schemaFile, cols); err != nil {
+			log.Printf("write schema file: %v", err)
+		}
+
+		// 6/7: build SELECT for snowflake using column list and types
+		selectList := buildSnowflakeSelect(cols, cfg)
+		query := fmt.Sprintf("SELECT %s FROM \"%s\".\"%s\"", strings.Join(selectList, ", "), schema, table)
+		log.Printf("Query: %.200s", query)
+
+		// execute and stream to gz
+		outBase := fmt.Sprintf("%s_%s", schema, table)
+		outPath := filepath.Join(cfg.Static.DataFilePath, outBase+".gz")
+		rowsCount, gzMembers, sha256hex, sizeBytes, err := streamQueryToGzip(sfdb, query, outPath, cfg)
+		if err != nil {
+			log.Printf("stream error: %v", err)
+			continue
+		}
+
+		// 9. write xml metadata
+		meta := XMLMeta{
+			FileName:       filepath.Base(outPath),
+			SHA256:         sha256hex,
+			FileSize:       sizeBytes,
+			Rows:           rowsCount,
+			GzipMembers:    gzMembers,
+			SchemaFilePath: schemaFile,
+			ReconFilePath:  filepath.Join(cfg.Static.ReconWritingDir, outBase+".recon"),
+			RecycleDate:    cfg.Static.RecycleDate,
+			RangeStart:     cfg.Static.RangeStart,
+			RangeEnd:       cfg.Static.RangeEnd,
+		}
+		xmlOut := filepath.Join(cfg.Static.DataFilePath, outBase+".xml")
+		if err := renderXMLTemplate(cfg.Static.XMLTemplatePath, xmlOut, meta); err != nil {
+			log.Printf("render xml: %v", err)
+		}
+
+		// 10. move gzip and xml to landing path
+		if err := moveFile(outPath, filepath.Join(cfg.Static.LandingFilePath, filepath.Base(outPath))); err != nil {
+			log.Printf("move gz: %v", err)
+		}
+		if err := moveFile(xmlOut, filepath.Join(cfg.Static.LandingFilePath, filepath.Base(xmlOut))); err != nil {
+			log.Printf("move xml: %v", err)
+		}
+
+		log.Printf("Finished %s.%s: rows=%d size=%d sha256=%s gzipMembers=%d", schema, table, rowsCount, sizeBytes, sha256hex, gzMembers)
+	}
+}
+
+// readConfig loads config.json
+func readConfig(path string) (*Config, error) {
+	b, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cfg Config
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		return nil, err
+	}
+	// defaults
+	if cfg.Output.NullString == "" {
+		cfg.Output.NullString = "\\N"
+	}
+	return &cfg, nil
+}
+
+// Column metadata
+type ColumnMeta struct {
+	Name string
+	Type string
+	Ord  int
+}
+
+// getTableColumnsFromSybase reads INFORMATION_SCHEMA.COLUMNS from Sybase
+func getTableColumnsFromSybase(db *sql.DB, schema, table string) ([]ColumnMeta, error) {
+	q := `SELECT COLUMN_NAME, DATA_TYPE, ORDINAL_POSITION FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION`
+	rows, err := db.Query(q, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cols := []ColumnMeta{}
+	for rows.Next() {
+		var name, dtype string
+		var ord int
+		if err := rows.Scan(&name, &dtype, &ord); err != nil {
+			return nil, err
+		}
+		cols = append(cols, ColumnMeta{Name: name, Type: dtype, Ord: ord})
+	}
+	return cols, nil
+}
+
+// writeSchemaFile writes a simple CSV of columns for downstream use
+func writeSchemaFile(path string, cols []ColumnMeta) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	for _, c := range cols {
+		_, _ = f.WriteString(fmt.Sprintf("%d,%s,%s\n", c.Ord, c.Name, c.Type))
+	}
+	return nil
+}
+
+// buildSnowflakeSelect builds expressions for selecting/formatting columns in Snowflake
+func buildSnowflakeSelect(cols []ColumnMeta, cfg *Config) []string {
+	exprs := make([]string, len(cols))
+	for i, c := range cols {
+		colIdent := fmt.Sprintf(`"%s"`, c.Name)
+		t := strings.ToUpper(c.Type)
+		var base string
+		if strings.Contains(t, "TIMESTAMP") {
+			base = fmt.Sprintf("TO_VARCHAR(%s, '%s')", colIdent, cfg.Output.TimestampFormat)
+		} else if strings.Contains(t, "DATE") && !strings.Contains(t, "TIME") {
+			base = fmt.Sprintf("TO_VARCHAR(%s, '%s')", colIdent, cfg.Output.DateFormat)
+		} else if strings.Contains(t, "BOOLEAN") || strings.Contains(t, "BOOL") {
+			if cfg.Output.BooleanAsInt {
+				base = fmt.Sprintf("IFF(%s, '1', '0')", colIdent)
+			} else {
+				base = fmt.Sprintf("TO_VARCHAR(%s)", colIdent)
+			}
+		} else if strings.Contains(t, "VARIANT") || strings.Contains(t, "OBJECT") || strings.Contains(t, "ARRAY") {
+			base = fmt.Sprintf("TO_JSON(%s)", colIdent)
+		} else {
+			// numbers, varchar, decimal: use TO_VARCHAR to get canonical textual representation
+			base = fmt.Sprintf("TO_VARCHAR(%s)", colIdent)
+		}
+		// sanitize newline and field sep
+		fsEsc := strings.ReplaceAll(cfg.Static.FieldSeparatorBinary, "'", "''")
+		nlEsc := strings.ReplaceAll(cfg.Output.NewlineReplacement, "'", "''")
+		// replace CR and LF
+		base = fmt.Sprintf("REPLACE(REPLACE(%s, '\\r', '%s'), '\\n', '%s')", base, nlEsc, nlEsc)
+		// replace field separator with escape sequence
+		base = fmt.Sprintf("REPLACE(%s, '%s', '%s')", base, fsEsc, strings.ReplaceAll(cfg.Output.EscapeSequence, "'", "''"))
+		// coalesce
+		exprs[i] = fmt.Sprintf("COALESCE(%s, '%s') AS %s", base, strings.ReplaceAll(cfg.Output.NullString, "'", "''"), colIdent)
+	}
+	return exprs
+}
+
+// streamQueryToGzip runs query, streams rows to gzip file and returns stats
+func streamQueryToGzip(db *sql.DB, query string, outPath string, cfg *Config) (int64, int, string, int64, error) {
+	ctx := context.TODO()
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return 0, 0, "", 0, err
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return 0, 0, "", 0, err
+	}
+	colCount := len(cols)
+
+	// prepare output directory
+	_ = os.MkdirAll(filepath.Dir(outPath), 0o755)
+	fout, err := os.Create(outPath)
+	if err != nil {
+		return 0, 0, "", 0, err
+	}
+	gw := gzip.NewWriter(fout)
+	defer func() {
+		gw.Close()
+		fout.Close()
+	}()
+
+	// prepare sha256 hasher while writing
+	// we'll compute sha256 by reopening file after closing writer
+
+	// create scan destinations
+	vals := make([]interface{}, colCount)
+	for i := range vals {
+		var v interface{}
+		vals[i] = &v
+	}
+
+	rowsCount := int64(0)
+	sep := cfg.Static.FieldSeparatorBinary
+	lineSep := cfg.Static.LineSeparatorBinary
+
+	for rows.Next() {
+		if err := rows.Scan(vals...); err != nil {
+			return rowsCount, 0, "", 0, err
+		}
+		fields := make([]string, colCount)
+		for i := 0; i < colCount; i++ {
+			raw := *(vals[i].(*interface{}))
+			if raw == nil {
+				fields[i] = cfg.Output.NullString
+				continue
+			}
+			switch v := raw.(type) {
+			case []byte:
+				fields[i] = string(v)
+			case string:
+				fields[i] = v
+			case time.Time:
+				// format using timestamp format (note: Snowflake TO_VARCHAR already formatted; this is a fallback)
+				fields[i] = v.Format(time.RFC3339)
+			default:
+				fields[i] = fmt.Sprintf("%v", v)
+			}
+		}
+		// join by separator (these separators are binary/control characters as strings)
+		line := strings.Join(fields, sep) + lineSep
+		if _, err := gw.Write([]byte(line)); err != nil {
+			return rowsCount, 0, "", 0, err
+		}
+		rowsCount++
+		// optional chunking: not implemented in middle of streaming - user can set chunkRows>0 to split afterwards or rerun
+	}
+
+	if err := rows.Err(); err != nil {
+		return rowsCount, 0, "", 0, err
+	}
+
+	// close writers to flush
+	if err := gw.Close(); err != nil {
+		return rowsCount, 0, "", 0, err
+	}
+	if err := fout.Close(); err != nil {
+		return rowsCount, 0, "", 0, err
+	}
+
+	// compute sha256 and size and gzip member count
+	sha256hex, sizeBytes, members, err := analyzeGzipFile(outPath)
+	if err != nil {
+		return rowsCount, members, "", sizeBytes, err
+	}
+
+	return rowsCount, members, sha256hex, sizeBytes, nil
+}
+
+// analyzeGzipFile computes sha256, size in bytes and counts gzip members (concatenated gz)
+func analyzeGzipFile(path string) (string, int64, int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	defer f.Close()
+
+	// filesize
+	st, err := f.Stat()
+	if err != nil {
+		return "", 0, 0, err
+	}
+	size := st.Size()
+
+	// sha256
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", 0, 0, err
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", 0, 0, err
+	}
+	sha := fmt.Sprintf("%x", h.Sum(nil))
+
+	// count gzip members by iterating readers
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return sha, size, 0, err
+	}
+	members := 0
+	for {
+		gr, err := gzip.NewReader(f)
+		if err != nil {
+			if err == io.EOF || err == gzip.ErrHeader {
+				break
+			}
+			// Some drivers return "unexpected EOF" when there are no more members; treat as done
+			break
+		}
+		members++
+		// discard content
+		if _, err := io.Copy(ioutil.Discard, gr); err != nil {
+			// if error reading content, still try to continue
+		}
+		gr.Close()
+		// gzip.NewReader stops at the end of the compressed member; file position is at next byte ready for next header
+	}
+
+	return sha, size, members, nil
+}
+
+// renderXMLTemplate renders the XML template at tplPath into outPath using meta
+func renderXMLTemplate(tplPath, outPath string, meta XMLMeta) error {
+	b, err := ioutil.ReadFile(tplPath)
+	if err != nil {
+		return err
+	}
+	tpl, err := template.New("xmltpl").Parse(string(b))
+	if err != nil {
+		return err
+	}
+	f, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return tpl.Execute(f, meta)
+}
+
+// moveFile moves (renames) file; tries copy+remove if rename fails (different filesystems)
+func moveFile(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	// fallback to copy
+	sf, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sf.Close()
+	df, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer df.Close()
+	if _, err := io.Copy(df, sf); err != nil {
+		return err
+	}
+	if err := sf.Close(); err != nil {
+		return err
+	}
+	return os.Remove(src)
+}
+
+/*
+NOTES & TODOs:
+- Sybase driver: this script uses database/sql. You must ensure an appropriate driver is imported and its name matches `sybase.driver` in config (e.g. "odbc" if using alexbrainman/odbc, or "dblib" for another driver). The code uses INFORMATION_SCHEMA.COLUMNS which is commonly supported; if your Sybase IQ instance needs different metadata queries, adjust getTableColumnsFromSybase.
+- Field/line separators are read as literal strings (control characters can be encoded in JSON as "\\u0001" for control-A). When writing, the script uses them directly.
+- Data-type handling: we format columns in Snowflake using TO_VARCHAR for stable textual representation of numbers/dates/timestamps, but preserved numeric formatting (no Go float formatting surprises). This prevents many re-load issues. If you prefer to stream raw binary values and format in Go, that can be added but requires careful handling of precision and timezones.
+- Chunking: currently the code writes one gz per table. If chunkRows>0 you may want to split after N rows; that can be implemented by closing and opening new gz files mid-stream.
+- Error handling/logging: for production, route logs to a file and add retries/backoff.
+*/
